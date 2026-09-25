@@ -63,3 +63,34 @@ class NeighborIn(BaseModel):
     inbound_policy: Optional[str] = None
     outbound_policy: Optional[str] = None
     description: str = ""
+
+
+# ---------------------------------------------------------------- RIB / impact
+
+class RibRouteIn(BaseModel):
+    prefix: str = Field(min_length=1)
+    nexthop: str = Field(min_length=1)
+
+
+class RibImportIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    neighbor: str = Field(default="", max_length=64)
+    family: int = Field(ge=4, le=6)
+    # ISO-8601 capture time as recorded OFFLINE (nothing connects to a router)
+    collected_at: str = Field(min_length=1)
+    source: str = ""
+    source_version: str = ""
+    routes: Optional[List[RibRouteIn]] = None
+    raw_text: Optional[str] = None
+
+
+class ImpactTaskIn(BaseModel):
+    old_snapshot_id: int
+    new_snapshot_id: int
+    rib_snapshot_id: int
+    run: bool = True
+
+
+class ImpactSampleIn(BaseModel):
+    node: str = "a"
+    sample_size: int = Field(default=20, ge=1, le=200)

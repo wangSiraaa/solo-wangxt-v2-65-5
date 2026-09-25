@@ -3,6 +3,7 @@ import { api } from './api.js'
 import PolicyEditor from './components/PolicyEditor.jsx'
 import TrieView from './components/TrieView.jsx'
 import DiffView from './components/DiffView.jsx'
+import ImpactLab from './components/ImpactLab.jsx'
 import ReplayLab from './components/ReplayLab.jsx'
 import Neighbors from './components/Neighbors.jsx'
 
@@ -10,8 +11,9 @@ const TABS = [
   { id: 'edit', label: '① 规则编辑 / 遮蔽检查', comp: PolicyEditor },
   { id: 'trie', label: '② 前缀树 / 命中链', comp: TrieView },
   { id: 'diff', label: '③ 语义差异（最小见证）', comp: DiffView },
-  { id: 'replay', label: '④ 回放 / FRR 交叉验证', comp: ReplayLab },
-  { id: 'neighbors', label: '⑤ 邻居', comp: Neighbors },
+  { id: 'impact', label: '④ RIB 实际影响分析', comp: ImpactLab },
+  { id: 'replay', label: '⑤ 回放 / FRR 交叉验证', comp: ReplayLab },
+  { id: 'neighbors', label: '⑥ 邻居', comp: Neighbors },
 ]
 
 export default function App() {

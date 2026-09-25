@@ -39,4 +39,21 @@ export const api = {
   crossValidate: (id, probes, node = 'a') =>
     req(`/snapshots/${id}/cross-validate`, { method: 'POST', body: { probes, node } }),
   runs: () => req('/runs'),
+
+  // RIB snapshots (offline imports only)
+  ribs: (family) => req(`/ribs${family ? `?family=${family}` : ''}`),
+  rib: (id, withRoutes = false) => req(`/ribs/${id}?routes=${withRoutes}`),
+  importRib: (b) => req('/ribs', { method: 'POST', body: b }),
+
+  // Impact analysis tasks
+  impactTasks: () => req('/impact/tasks'),
+  impactTask: (id, withRoutes = true) =>
+    req(`/impact/tasks/${id}?routes=${withRoutes}`),
+  createImpact: (b) => req('/impact/tasks', { method: 'POST', body: b }),
+  retryImpact: (id) =>
+    req(`/impact/tasks/${id}/retry`, { method: 'POST' }),
+  impactEvidence: (id, node = 'a', sampleSize = 20) =>
+    req(`/impact/tasks/${id}/cross-validate`, {
+      method: 'POST', body: { node, sample_size: sampleSize },
+    }),
 };

@@ -9,10 +9,18 @@ Seed the workbench with the three required worked scenarios.
 
 Each scenario stores two snapshots (before/after) plus an ordered probe
 list, so it is fully replayable.
+
+Offline RIB captures are seeded too (nothing connects to a router):
+
+* two DIFFERENT RIB snapshots for the over-permit neighbor, so the same
+  before/after policy pair demonstrably has a different ACTUAL impact on
+  the reachable prefixes each RIB hands the policy;
+* one IPv6 RIB for over-permit-v6 (strict family isolation);
+* one LATE capture (older collected_at) kept purely as a historical version.
 """
 from __future__ import annotations
 
-from . import db as dbmod, service
+from . import db as dbmod, impact, rib, service
 
 
 SEEDS = {
@@ -147,6 +155,63 @@ NEIGHBORS = [
 ]
 
 
+# Offline RIB captures (neighbor, family, collected_at, source/version,
+# routes). Two IPv4 RIBs for the SAME neighbor at different times hold
+# different reachable prefix sets, so the over-permit before/after policy
+# pair has a genuinely different ACTUAL impact on each.  The third entry is
+# LATE (older than the newest capture for that neighbor) and is retained
+# only as a historical version (stale=True).
+RIBS = [
+    dict(
+        name="edge-r1 RIB 2026-09-20 morning", neighbor="edge-r1", family=4,
+        collected_at="2026-09-20T08:00:00+00:00",
+        source="show ip bgp export", source_version="FRR 8.4.1",
+        routes=[
+            ("192.168.100.0/24", "10.255.0.1"),   # permit -> deny
+            ("192.168.200.0/24", "10.255.0.1"),   # permit -> deny
+            ("192.168.200.0/23", "10.255.0.1"),   # permit -> permit
+            ("10.0.0.0/8", "10.255.0.254"),       # deny -> deny (seq 10)
+            ("8.8.8.8/32", "10.255.0.254"),       # default deny, unmatched
+        ],
+    ),
+    dict(
+        name="edge-r1 RIB 2026-09-20 evening", neighbor="edge-r1", family=4,
+        collected_at="2026-09-20T20:00:00+00:00",
+        source="show ip bgp export", source_version="FRR 8.4.1",
+        routes=[
+            ("192.168.0.0/24", "10.255.0.1"),     # permit -> deny
+            ("192.168.50.0/24", "10.255.0.1"),    # permit -> deny
+            ("192.168.100.128/25", "10.255.0.1"),  # permit -> default deny
+            ("10.0.0.0/8", "10.255.0.254"),       # deny -> deny (seq 10)
+            ("203.0.113.0/24", "10.255.0.254"),   # default deny, unmatched
+        ],
+    ),
+    dict(
+        name="edge-v6-r1 RIB 2026-09-20", neighbor="edge-v6-r1", family=6,
+        collected_at="2026-09-20T08:30:00+00:00",
+        source="show ipv6 bgp export", source_version="FRR 8.4.1",
+        routes=[
+            ("2001:db8:1::/48", "2001:db8:ffff::254"),   # deny -> deny
+            ("2001:db8:2::/48", "2001:db8:ffff::1"),     # permit -> deny
+            ("2001:db8::/40", "2001:db8:ffff::1"),       # permit -> permit
+            ("2001:db8:dead::/64", "2001:db8:ffff::1"),  # default deny
+            ("2001:dead::/32", "2001:db8:ffff::254"),    # default deny
+        ],
+    ),
+    dict(
+        # arrives/imported LAST but is OLDER -> historical version only
+        name="edge-r1 RIB 2026-09-19 (late import)", neighbor="edge-r1",
+        family=4, collected_at="2026-09-19T23:00:00+00:00",
+        source="show ip bgp export", source_version="FRR 8.4.1",
+        routes=[
+            ("192.168.100.0/24", "10.255.0.1"),
+            ("192.168.201.0/24", "10.255.0.1"),
+            ("10.1.2.3/32", "10.255.0.254"),
+        ],
+    ),
+]
+
+
 def seed_all() -> None:
     dbmod.init_db()
     s = dbmod.SessionLocal()
@@ -155,6 +220,7 @@ def seed_all() -> None:
             if not s.query(dbmod.Neighbor).filter_by(name=nb["name"]).first():
                 s.add(dbmod.Neighbor(**nb))
 
+        snapshot_ids = {}
         for family, scenarios in SEEDS.items():
             for slug, spec in scenarios.items():
                 pname = slug
@@ -182,6 +248,47 @@ def seed_all() -> None:
                     )
                     s.add(sc)
                     s.commit()
+                else:
+                    snaps = (s.query(dbmod.Snapshot)
+                             .filter_by(policy_id=dbp.id)
+                             .order_by(dbmod.Snapshot.version).all())
+                    snap_before, snap_after = snaps[0], snaps[-1]
+                snapshot_ids[pname] = (snap_before.id, snap_after.id)
+
+        # Offline RIB snapshots (idempotent: identical content reuses the
+        # frozen row).  Order matters for the stale-history check: the late
+        # capture is imported after the newer ones.
+        rib_ids = {}
+        for spec in RIBS:
+            existing = (s.query(dbmod.RibSnapshot)
+                        .filter_by(name=spec["name"]).first())
+            if existing is None:
+                rsnap = rib.import_snapshot(
+                    s, name=spec["name"], neighbor=spec["neighbor"],
+                    family=spec["family"], collected_at=spec["collected_at"],
+                    source=spec["source"], source_version=spec["source_version"],
+                    routes=[{"prefix": p, "nexthop": nh}
+                            for p, nh in spec["routes"]])
+            else:
+                rsnap = existing
+            rib_ids[spec["name"]] = rsnap
+
+        # Pre-bind impact analyses so the workbench opens with real
+        # same-policy/two-RIB, different-actual-impact evidence.
+        def _ensure_task(old_id, new_id, rsnap):
+            have = s.query(dbmod.ImpactTask).filter_by(
+                old_snapshot_id=old_id, new_snapshot_id=new_id,
+                rib_snapshot_id=rsnap.id).first()
+            if have is None:
+                impact.create_task(
+                    s, old_snapshot_id=old_id, new_snapshot_id=new_id,
+                    rib_snapshot_id=rsnap.id, run=True)
+
+        b_id, a_id = snapshot_ids["over-permit"]
+        _ensure_task(b_id, a_id, rib_ids["edge-r1 RIB 2026-09-20 morning"])
+        _ensure_task(b_id, a_id, rib_ids["edge-r1 RIB 2026-09-20 evening"])
+        b6, a6 = snapshot_ids["over-permit-v6"]
+        _ensure_task(b6, a6, rib_ids["edge-v6-r1 RIB 2026-09-20"])
     finally:
         s.close()
 

@@ -3,19 +3,21 @@ from __future__ import annotations
 
 import ipaddress
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
-from .. import db as dbmod, service
+from .. import db as dbmod, impact, rib, service
 from ..engine import PolicyError
+from ..frr_bridge import FRRUnavailable
 from ..schemas import (
-    ClassifyIn, DiffIn, NeighborIn, PolicyIn, PolicyRulesIn, ProbesIn,
-    ScenarioIn, SnapshotIn,
+    ClassifyIn, DiffIn, ImpactSampleIn, ImpactTaskIn, NeighborIn, PolicyIn,
+    PolicyRulesIn, ProbesIn, RibImportIn, ScenarioIn, SnapshotIn,
 )
 from ..service import ValidationError
 from ..treeview import policy_trie, hit_path, coverage_map
 from ..validate import cross_validate_snapshot
-from ..frr_bridge import FRRBridge, FRRUnavailable
+from ..frr_bridge import FRRBridge
 
 router = APIRouter(prefix="/api")
 
@@ -313,3 +315,130 @@ def replay_scenario(scid: int, db: Session = Depends(get_db)):
     s.results = out
     db.commit()
     return out
+
+
+# ============================================================== RIB snapshots
+# No endpoint here ever talks to a router: the RIB arrives as an offline
+# capture (structured rows or pasted table text).
+
+@router.get("/ribs")
+def list_ribs(family: int | None = None, db: Session = Depends(get_db)):
+    q = db.query(dbmod.RibSnapshot)
+    if family is not None:
+        q = q.filter(dbmod.RibSnapshot.family == family)
+    return [rib.rib_snapshot_dict(s)
+            for s in q.order_by(dbmod.RibSnapshot.collected_at.desc(),
+                                dbmod.RibSnapshot.id.desc()).all()]
+
+
+@router.post("/ribs", status_code=201)
+def import_rib(body: RibImportIn, db: Session = Depends(get_db)):
+    if not body.routes and not body.raw_text:
+        raise HTTPException(422, "provide routes[] or raw_text")
+    if body.routes and body.raw_text:
+        raise HTTPException(422, "provide either routes[] or raw_text, not both")
+    try:
+        snap = rib.import_snapshot(
+            db, name=body.name, neighbor=body.neighbor, family=body.family,
+            collected_at=body.collected_at, source=body.source,
+            source_version=body.source_version,
+            routes=([r.model_dump() for r in body.routes]
+                    if body.routes else None),
+            raw_text=body.raw_text)
+    except rib.RibImportError as e:
+        db.rollback()                       # whole batch fails atomically
+        raise HTTPException(422, str(e))
+    return rib.rib_snapshot_dict(snap)
+
+
+@router.get("/ribs/{rid}")
+def get_rib(rid: int, routes: bool = False,
+            limit: int | None = Query(default=None, ge=1, le=100000),
+            db: Session = Depends(get_db)):
+    s = db.get(dbmod.RibSnapshot, rid)
+    if s is None or not s.frozen:
+        raise HTTPException(404, "RIB snapshot not found or not frozen")
+    return rib.rib_snapshot_dict(s, with_routes=routes, limit=limit)
+
+
+# ============================================================ impact analysis
+
+def _task_with_evidence(db: Session, task: dbmod.ImpactTask,
+                        with_routes: bool) -> dict:
+    ev = db.query(dbmod.ImpactEvidence).filter_by(task_id=task.id) \
+        .order_by(dbmod.ImpactEvidence.id.desc()).all()
+    return impact.task_dict(task, with_routes=with_routes, evidence=ev)
+
+
+@router.post("/impact/tasks", status_code=201)
+def create_impact_task(body: ImpactTaskIn, db: Session = Depends(get_db)):
+    try:
+        task = impact.create_task(
+            db, old_snapshot_id=body.old_snapshot_id,
+            new_snapshot_id=body.new_snapshot_id,
+            rib_snapshot_id=body.rib_snapshot_id, run=body.run)
+    except (ValidationError, PolicyError, rib.RibImportError) as e:
+        raise HTTPException(422, str(e))
+    return _task_with_evidence(db, task, with_routes=True)
+
+
+@router.get("/impact/tasks")
+def list_impact_tasks(db: Session = Depends(get_db)):
+    tasks = db.query(dbmod.ImpactTask) \
+        .order_by(dbmod.ImpactTask.id.desc()).all()
+    return [impact.task_dict(t, with_routes=False) for t in tasks]
+
+
+@router.get("/impact/tasks/{tid}")
+def get_impact_task(tid: int, routes: bool = True,
+                    db: Session = Depends(get_db)):
+    t = db.get(dbmod.ImpactTask, tid)
+    if t is None:
+        raise HTTPException(404, "task not found")
+    return _task_with_evidence(db, t, with_routes=routes)
+
+
+@router.post("/impact/tasks/{tid}/retry")
+def retry_impact_task(tid: int, db: Session = Depends(get_db)):
+    t = db.get(dbmod.ImpactTask, tid)
+    if t is None:
+        raise HTTPException(404, "task not found")
+    if t.status == "succeeded":
+        return _task_with_evidence(db, t, with_routes=True)
+    impact.run_task(db, tid)
+    db.refresh(t)
+    if t.status == "failed":
+        raise HTTPException(422, t.error or "analysis failed")
+    return _task_with_evidence(db, t, with_routes=True)
+
+
+@router.get("/impact/tasks/{tid}/export", response_class=PlainTextResponse)
+def export_impact_task(tid: int, db: Session = Depends(get_db)):
+    t = db.get(dbmod.ImpactTask, tid)
+    if t is None:
+        raise HTTPException(404, "task not found")
+    try:
+        text = impact.export_text(t)
+    except ValidationError as e:
+        raise HTTPException(409, str(e))
+    return PlainTextResponse(
+        text,
+        headers={"Content-Disposition":
+                 f'attachment; filename="impact-task-{tid}.txt"'})
+
+
+@router.post("/impact/tasks/{tid}/cross-validate", status_code=201)
+def cross_validate_impact(tid: int, body: ImpactSampleIn,
+                          db: Session = Depends(get_db)):
+    """FRR container evidence for a LIMITED RIB sample (corroboration only)."""
+    t = db.get(dbmod.ImpactTask, tid)
+    if t is None:
+        raise HTTPException(404, "task not found")
+    try:
+        ev = impact.cross_validate_sample(
+            db, tid, node=body.node, sample_size=body.sample_size)
+    except FRRUnavailable as e:
+        raise HTTPException(503, str(e))
+    except ValidationError as e:
+        raise HTTPException(409, str(e))
+    return impact._evidence_dict(ev)

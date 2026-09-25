@@ -31,7 +31,8 @@ def db():
     dbmod.init_db()
     s = dbmod.SessionLocal()
     # clean slate for ordering-sensitive tests
-    for tbl in (dbmod.Run, dbmod.Scenario, dbmod.Snapshot,
+    for tbl in (dbmod.ImpactEvidence, dbmod.ImpactTask, dbmod.RibRoute,
+                dbmod.RibSnapshot, dbmod.Run, dbmod.Scenario, dbmod.Snapshot,
                 dbmod.Rule, dbmod.Policy, dbmod.Neighbor):
         s.query(tbl).delete()
     s.commit()

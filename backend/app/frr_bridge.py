@@ -35,6 +35,8 @@ import paramiko
 from .config import (
     FRR_HOST_A, FRR_HOST_B, FRR_SSH_PORT_A, FRR_SSH_PORT_B,
     FRR_SSH_USER, FRR_SSH_PASSWORD,
+    FRR_LOCAL_VTYSH, FRR_LOCAL_VTY_SOCKET, FRR_LOCAL_CONFIG_DIR,
+    FRR_LOCAL_DAEMON, FRR_LOCAL_ENV,
 )
 from .engine import Policy
 
@@ -79,7 +81,7 @@ class FRRBridge:
             if not shutil.which("docker"):
                 raise FRRUnavailable(
                     "docker CLI not found; start the API host with docker access "
-                    "or set RLAB_FRR_TRANSPORT=ssh"
+                    "or set RLAB_FRR_TRANSPORT=ssh|local"
                 )
             try:
                 self._docker(["true"])
@@ -88,6 +90,17 @@ class FRRBridge:
                     f"container {self.container!r} not running. "
                     "Start: docker compose -f frr/docker-compose.yml up -d"
                 )
+        elif self.transport == "local":
+            # native vtysh against a unix vty socket on this host (no docker)
+            if not os.path.exists(FRR_LOCAL_VTYSH):
+                if not shutil.which(FRR_LOCAL_VTYSH):
+                    raise FRRUnavailable(
+                        f"local vtysh {FRR_LOCAL_VTYSH!r} not found")
+            try:
+                self._local(["show version"])
+            except FRRUnavailable:
+                raise FRRUnavailable(
+                    f"local FRR at socket {FRR_LOCAL_VTY_SOCKET!r} unreachable")
         elif self.transport == "ssh":
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -131,12 +144,45 @@ class FRRBridge:
                 f"docker exec rc={p.returncode}: {p.stderr.strip() or p.stdout.strip()}")
         return p.stdout + p.stderr
 
+    def _local_env(self) -> dict:
+        env = os.environ.copy()
+        for pair in FRR_LOCAL_ENV.split(","):
+            pair = pair.strip()
+            if pair and "=" in pair:
+                k, v = pair.split("=", 1)
+                env[k] = v
+        return env
+
+    def _local(self, argv: List[str]) -> str:
+        args = [FRR_LOCAL_VTYSH, "--config_dir", FRR_LOCAL_CONFIG_DIR,
+                "--vty_socket", FRR_LOCAL_VTY_SOCKET,
+                "-d", FRR_LOCAL_DAEMON]
+        for c in argv:
+            args += ["-c", c]
+        try:
+            p = subprocess.run(args, capture_output=True, text=True,
+                               timeout=self.timeout, env=self._local_env(),
+                               input="")
+        except subprocess.TimeoutExpired as e:
+            raise FRRUnavailable(
+                f"local vtysh timeout: {' '.join(argv)}") from e
+        except OSError as e:
+            raise FRRUnavailable(f"local vtysh failed: {e}") from e
+        if p.returncode not in (0, 1):
+            raise FRRUnavailable(
+                f"local vtysh rc={p.returncode}: "
+                f"{p.stderr.strip() or p.stdout.strip()}")
+        return p.stdout + p.stderr
+
     def vtysh(self, commands: List[str], allow_warning_rc: bool = False) -> str:
         if self.transport == "docker":
             args = []
             for c in commands:
                 args += ["-c", c]
             return self._docker(["vtysh"] + args, allow_warning_rc=allow_warning_rc)
+
+        if self.transport == "local":
+            return self._local(commands)
 
         # ssh
         assert self._client is not None, "not connected"
@@ -191,11 +237,20 @@ class FRRBridge:
     def observe(self, policy_name: str, family: int, prefix: str,
                 vrf: str = "") -> FRRObservation:
         ip = "ip" if family == 4 else "ipv6"
+        # FRR 8.5+ and the container lab (8.4.1 images) accept
+        #   debug {ip|ipv6} prefix-list NAME match PREFIX
+        # the Debian-native 8.4.x build instead exposes the oracle under
+        #   debug prefix-list NAME match PREFIX
+        # Try the ip/ipv6 form first, fall back when the CLI rejects it.
         probe = f"debug {ip} prefix-list {policy_name} match {prefix}"
         cmds = [f"vrf {vrf}", probe] if vrf else [probe]
         # PERMIT -> rc 0, DENY -> CMD_WARNING(1), so do not treat rc!=0 as
         # a transport error: parse both streams.
         raw = self.vtysh(cmds, allow_warning_rc=True)
+        if "Unknown command" in raw or "no matched command" in raw.lower():
+            probe2 = f"debug prefix-list {policy_name} match {prefix}"
+            cmds = [f"vrf {vrf}", probe2] if vrf else [probe2]
+            raw = self.vtysh(cmds, allow_warning_rc=True)
 
         m = self._YIELDS_RE.search(raw)
         action = "error"

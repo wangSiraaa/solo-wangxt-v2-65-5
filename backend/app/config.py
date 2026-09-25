@@ -22,4 +22,13 @@ FRR_SSH_PORT_B = int(os.environ.get("FRR_SSH_PORT_B", "2223"))
 FRR_SSH_USER = os.environ.get("FRR_SSH_USER", "root")
 FRR_SSH_PASSWORD = os.environ.get("FRR_SSH_PASSWORD", "frrouting")
 
+# "local" transport: a native vtysh on the API host (e.g. FRR extracted
+# from debs into a prefix, run unprivileged with a unix vty socket).
+FRR_LOCAL_VTYSH = os.environ.get("FRR_LOCAL_VTYSH", "vtysh")
+FRR_LOCAL_VTY_SOCKET = os.environ.get("FRR_LOCAL_VTY_SOCKET", "/var/run/frr")
+FRR_LOCAL_CONFIG_DIR = os.environ.get("FRR_LOCAL_CONFIG_DIR", "/etc/frr")
+FRR_LOCAL_DAEMON = os.environ.get("FRR_LOCAL_DAEMON", "bgpd")
+# optional environment to inject (LD_LIBRARY_PATH/LD_PRELOAD/NSS_WRAPPER_*)
+FRR_LOCAL_ENV = os.environ.get("FRR_LOCAL_ENV", "")
+
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",")

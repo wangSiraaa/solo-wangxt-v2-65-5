@@ -93,3 +93,23 @@ th { color: var(--muted); font-weight: 600; }
 .cvbox.mismatch { border-left: 4px solid var(--deny); }
 tr.badrow { background: rgba(255,107,107,.08); }
 tr.okrow { background: rgba(46,204,113,.06); }
+tr.warnrow { background: rgba(244,183,64,.07); }
+/* RIB / impact */
+.stats { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0 10px; }
+.stat { background: #0c111c; border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 12px; min-width: 84px; text-align: center; }
+.stat .num { font-size: 20px; font-weight: 700; }
+.stat .lab { font-size: 11.5px; color: var(--muted); }
+.stat.permit .num { color: var(--permit); }
+.stat.deny .num { color: var(--deny); }
+.stat.warn .num { color: var(--warn); }
+.tag.ok { background: #143a24; color: #87e0a3; }
+.settabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.settabs button.active { outline: 2px solid var(--accent); }
+.settabs .permit { border-color: rgba(46,204,113,.5); }
+.settabs .deny { border-color: rgba(255,107,107,.5); }
+.settabs .warn { border-color: rgba(244,183,64,.5); }
+.routetable { font-size: 13px; }
+.chainwrap { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  padding: 8px 4px; }
+@media (max-width: 1000px) { .chainwrap { grid-template-columns: 1fr; } }
