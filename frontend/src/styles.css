@@ -93,3 +93,11 @@ th { color: var(--muted); font-weight: 600; }
 .cvbox.mismatch { border-left: 4px solid var(--deny); }
 tr.badrow { background: rgba(255,107,107,.08); }
 tr.okrow { background: rgba(46,204,113,.06); }
+/* rib impact */
+.formgrid { display: grid; grid-template-columns: 84px 1fr; gap: 6px 10px;
+  align-items: center; margin-bottom: 8px; }
+.formgrid label { color: var(--muted); font-size: 12.5px; text-align: right; }
+a.mini { color: var(--accent); font-size: 12px; margin-right: 6px; text-decoration: none; }
+a.mini:hover { text-decoration: underline; }
+h4 { margin: 14px 0 8px; }
+h5 { margin: 6px 0; color: var(--muted); }

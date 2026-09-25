@@ -1,7 +1,8 @@
 """Pydantic request/response schemas."""
 from __future__ import annotations
 
-from typing import List, Optional
+import datetime as dt
+from typing import List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -63,3 +64,31 @@ class NeighborIn(BaseModel):
     inbound_policy: Optional[str] = None
     outbound_policy: Optional[str] = None
     description: str = ""
+
+
+class RibRouteIn(BaseModel):
+    prefix: str
+    next_hop: str
+
+
+class RibImportIn(BaseModel):
+    """One RIB collection batch.  `routes` accepts "PREFIX NEXT_HOP" strings
+    or {"prefix", "next_hop"} objects; any illegal line fails the whole batch."""
+    neighbor: Optional[str] = None
+    neighbor_id: Optional[int] = None
+    family: int = 4
+    collected_at: dt.datetime
+    source_version: str = Field(min_length=1, max_length=128)
+    label: str = ""
+    routes: List[Union[RibRouteIn, str]] = Field(min_length=1)
+
+
+class ImpactTaskIn(BaseModel):
+    rib_snapshot_id: int
+    old_snapshot_id: int
+    new_snapshot_id: int
+
+
+class ImpactCVIn(BaseModel):
+    node: str = "a"
+    limit: int = Field(default=50, ge=1, le=500)

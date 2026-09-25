@@ -2,10 +2,39 @@
 
 在**发布前**离线看清前缀策略会放行/拒绝哪些前缀。完全本地，**不连接任何生产设备**。
 
-* **React**：前缀树 + 命中链可视化、规则编辑、遮蔽检查、语义差异（最小见证前缀集）、有序回放、FRR 交叉验证
+* **React**：前缀树 + 命中链可视化、规则编辑、遮蔽检查、语义差异（最小见证前缀集）、有序回放、RIB 影响分析、FRR 交叉验证
 * **FastAPI**：REST API，判定核心用 Python 标准库 **`ipaddress`**
-* **PostgreSQL**：邻居、有序规则、不可变配置快照、场景、验证运行（也可用 SQLite 免依赖运行）
+* **PostgreSQL**：邻居、有序规则、不可变配置快照、场景、验证运行、RIB 快照、影响分析任务（也可用 SQLite 免依赖运行）
 * **FRRouting 容器**（router-a / router-b，隔离 bridge）：用 FRR 自己的 prefix-list 匹配器做交叉验证
+
+---
+
+## 0. RIB 快照与影响分析（不连接路由器）
+
+策略审查不能只看规则全集——还需要知道**某份离线路由清单实际会把哪些可达前缀交给该策略**。系统支持导入离线 RIB 快照（如 `show ip bgp` 采集的文本），并回答“这次策略改动对**这批真实路由**到底有什么影响”。
+
+### RIB 快照导入
+
+* 每条路由记录 **邻居、地址族、前缀、下一跳**；快照整体记录 **采集时间（collected_at）与来源版本（source_version，如 `frr-8.4.1/show-ip-bgp#20260925`）**；
+* **原子冻结**：整批一个事务，任何一条非法行（坏前缀、host bits、坏下一跳、跨族混入）→ **整批失败，什么都不落库**；冻结后没有任何修改/删除入口；
+* **去重**：批内相同 `(前缀, 下一跳)` 只保留首条（保留原始行号 ordinal）；同一 `(邻居, 族, 采集时间, 来源版本)` 的重复导入**幂等**——返回已存在快照，不重复路由；同身份不同内容 → 409 冲突；
+* **迟到的旧 RIB 只能作为历史版本**：按 `(邻居, 族)` 以采集时间判定 `is_latest`，旧采集导入后只作历史，绝不顶替较新的快照；
+* 每个快照带路由集 sha256（`content_hash`），可导出为可再导入的 JSON。
+
+### 影响分析任务（绑定完整输入，结果不串版）
+
+对**任意两个策略快照** × **选定 RIB** 创建分析任务：
+
+* 逐路由分类，给出 **实际命中 / 被放行 / 被拒绝 / 无匹配（落到默认）/ 行为变化** 五个集合（汇总计数 + 逐路由明细，含新旧两条完整命中链）；
+* **同时保留全空间最小见证分析**（精确单元枚举的语义证明）——RIB 只是真实样本，**绝不用采样清单替代语义证明**，两者在同一个结果里并列呈现；
+* 任务在创建时绑定完整输入并计算 `input_fingerprint`（RIB content_hash + 两个策略快照 payload 哈希）；运行前重新校验指纹，不符则失败而**不是**写入串版结果；
+* 状态机 `pending → running → done|failed`：**失败可重试**（输入不可变，重试结果确定一致）；`done` 为终态，结果**永不被改写**——之后改策略、导入更新 RIB 都不影响已完成任务；
+* 服务重启时，遗留在 `running` 的任务被标记为 `failed`（可重试），结果、来源与容器证据全部持久化可回放；
+* 数据库变更通过**版本化迁移**（`schema_migrations` 表）应用，老库自动升级。
+
+### FRR 有限样本交叉验证
+
+对已完成任务，把**新策略快照**下发到本地 FRR 容器，抽取 RIB 的**有限样本**（行为变化的路由优先，可设上限）逐条比对；比对运行写入 `runs` 表并关联任务 id，作为可回放的容器证据。
 
 ---
 
@@ -110,6 +139,7 @@ python -m pytest tests/ -q
 * `test_engine.py`：精确匹配、ge/le 窗口、首条匹配、默认拒绝、v4/v6 隔离、三个示例决策；
 * `test_properties.py`：在完整枚举的 /0../6（v4）与 /32../34（v6）格子上，对数百个随机策略用暴力预言机验证**遮蔽判定**与**最小见证集**逐区域一致（非采样）；
 * `test_api.py`：编辑→快照→差异→回放的端到端 REST；
+* `test_rib_impact.py`：RIB/影响分析验收——同一策略对两个 RIB 不同实际影响、重复导入不重复路由、v4/v6 严格隔离、分析后策略/RIB 更新不改写结果、非法行整批失败、失败重试与重启恢复后结果/来源/容器证据可回放、迟到旧 RIB 仅作历史版本；
 * `test_frr_consistency.py`：FRR 输出解析、随机 400 例与 FRR `prefix_list_apply` 移植模型逐条一致；`test_live_frr_consistency` 在检测到容器时自动对真实 FRR 运行。
 
 ## 7. 主要 API
@@ -128,15 +158,23 @@ python -m pytest tests/ -q
 | POST | `/api/snapshots/{id}/cross-validate` | 推送 FRR 容器并逐条比对 |
 | GET/POST | `/api/scenarios`、`/api/scenarios/{id}/replay` | 场景（输入+两个快照+结果） |
 | GET/POST | `/api/neighbors` | 本地实验室邻居 |
+| POST | `/api/ribs/import` | 导入并原子冻结 RIB 快照（去重、幂等、非法行整批失败、迟到为历史版本） |
+| GET | `/api/ribs`、`/api/ribs/{id}`、`/api/ribs/{id}/export` | RIB 快照列表/详情/可再导入导出 |
+| POST | `/api/impact/tasks` | 创建并运行影响分析（RIB × 两个策略快照；同输入幂等返回） |
+| GET | `/api/impact/tasks`、`/api/impact/tasks/{id}` | 任务列表/详情（含逐路由结果与语义证明） |
+| POST | `/api/impact/tasks/{id}/retry` | 重试失败/被中断任务（done 返回 409） |
+| POST | `/api/impact/tasks/{id}/cross-validate` | FRR 有限样本（变化优先）交叉验证，证据入 `runs` |
+| GET | `/api/impact/tasks/{id}/runs`、`/api/impact/tasks/{id}/export?format=json\|csv` | 容器证据、自包含导出 |
 | GET | `/api/frr/status`、`/api/runs` | 容器在线状态、历史验证运行 |
 
 ## 目录
 
 ```
-backend/app/   engine.py(匹配/遮蔽) trie.py(精确单元+最小见证) service.py db.py
+backend/app/   engine.py(匹配/遮蔽) trie.py(精确单元+最小见证) service.py db.py(模型+版本化迁移)
+               rib.py(RIB解析/去重/影响计算) impact.py(导入冻结/任务状态机/导出)
                validate.py frr_bridge.py treeview.py routers/api.py seed.py
-frontend/src/  App.jsx + components/(PolicyEditor/TrieView/DiffView/ReplayLab/Neighbors)
+frontend/src/  App.jsx + components/(PolicyEditor/TrieView/DiffView/ReplayLab/RibImpact/Neighbors)
 frr/           两个节点的 daemons/vtysh/frr.conf 与独立 docker-compose
-tests/         引擎/属性/API/FRR 一致性
+tests/         引擎/属性/API/RIB影响分析/FRR 一致性
 docker-compose.yml   postgres + backend + router-a/b
 ```

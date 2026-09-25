@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from .. import db as dbmod, service
+from .. import db as dbmod, impact, service
 from ..engine import PolicyError
+from ..rib import RibImportError
+from ..impact import RibConflictError
 from ..schemas import (
-    ClassifyIn, DiffIn, NeighborIn, PolicyIn, PolicyRulesIn, ProbesIn,
-    ScenarioIn, SnapshotIn,
+    ClassifyIn, DiffIn, ImpactCVIn, ImpactTaskIn, NeighborIn, PolicyIn,
+    PolicyRulesIn, ProbesIn, RibImportIn, ScenarioIn, SnapshotIn,
 )
 from ..service import ValidationError
 from ..treeview import policy_trie, hit_path, coverage_map
@@ -83,6 +87,17 @@ def update_policy_meta(pid: int, body: PolicyIn, db: Session = Depends(get_db)):
 @router.delete("/policies/{pid}", status_code=204)
 def delete_policy(pid: int, db: Session = Depends(get_db)):
     p = _get_policy(db, pid)
+    # impact tasks bind policy snapshots as immutable inputs; deleting the
+    # policy would cascade-remove them and break replayability.
+    bound = db.query(dbmod.ImpactTask) \
+        .join(dbmod.Snapshot,
+              (dbmod.ImpactTask.old_snapshot_id == dbmod.Snapshot.id) |
+              (dbmod.ImpactTask.new_snapshot_id == dbmod.Snapshot.id)) \
+        .filter(dbmod.Snapshot.policy_id == pid).first()
+    if bound is not None:
+        raise HTTPException(
+            409, f"policy is bound to impact task {bound.id}; "
+                 "its snapshots must stay replayable")
     db.delete(p)
     db.commit()
 
@@ -313,3 +328,149 @@ def replay_scenario(scid: int, db: Session = Depends(get_db)):
     s.results = out
     db.commit()
     return out
+
+
+# ---------------------------------------------------------------- RIB import
+@router.post("/ribs/import", status_code=201)
+def import_rib(body: RibImportIn, db: Session = Depends(get_db)):
+    """
+    Atomically freeze one offline RIB collection.  Any illegal line fails
+    the WHOLE batch (nothing is persisted).  Re-importing the identical
+    collection is idempotent (200 + the existing snapshot, no duplicate
+    routes); a late-arriving older collection is stored as a historical
+    version (is_latest=false).
+    """
+    routes = [r.model_dump() if hasattr(r, "model_dump") else r
+              for r in body.routes]
+    try:
+        snap, created, collapsed = impact.import_rib(
+            db, neighbor_id=body.neighbor_id, neighbor_name=body.neighbor,
+            family=body.family, collected_at=body.collected_at,
+            source_version=body.source_version, label=body.label,
+            routes=routes)
+    except RibImportError as e:
+        raise HTTPException(422, str(e))
+    except RibConflictError as e:
+        raise HTTPException(409, str(e))
+    except ValidationError as e:
+        raise HTTPException(422, str(e))
+    d = impact.rib_dict(db, snap)
+    d["created"] = created
+    d["deduplicated"] = not created
+    d["duplicates_collapsed"] = collapsed
+    if not d["is_latest"]:
+        d["warning"] = ("late arrival: a newer collection already exists for "
+                        "this neighbor/family; stored as a historical version")
+    return JSONResponse(d, status_code=201 if created else 200)
+
+
+@router.get("/ribs")
+def list_ribs(db: Session = Depends(get_db)):
+    snaps = db.query(dbmod.RibSnapshot) \
+        .order_by(dbmod.RibSnapshot.neighbor_id, dbmod.RibSnapshot.family,
+                  dbmod.RibSnapshot.collected_at.desc()).all()
+    return [impact.rib_dict(db, s) for s in snaps]
+
+
+@router.get("/ribs/{rid}")
+def get_rib(rid: int, db: Session = Depends(get_db)):
+    snap = db.get(dbmod.RibSnapshot, rid)
+    if snap is None:
+        raise HTTPException(404, "RIB snapshot not found")
+    return impact.rib_dict(db, snap, include_routes=True)
+
+
+@router.get("/ribs/{rid}/export")
+def export_rib(rid: int, db: Session = Depends(get_db)):
+    """Self-contained, re-importable JSON of one frozen RIB snapshot."""
+    snap = db.get(dbmod.RibSnapshot, rid)
+    if snap is None:
+        raise HTTPException(404, "RIB snapshot not found")
+    d = impact.rib_dict(db, snap, include_routes=True)
+    d["export_kind"] = "rib-snapshot/v1"
+    return Response(
+        content=json.dumps(d, indent=1, ensure_ascii=False),
+        media_type="application/json",
+        headers={"Content-Disposition":
+                 f'attachment; filename="rib-{rid}.json"'})
+
+
+# ------------------------------------------------------------- impact tasks
+@router.post("/impact/tasks")
+def create_impact_task(body: ImpactTaskIn, db: Session = Depends(get_db)):
+    """
+    Create (idempotently) and run an impact analysis: the selected RIB's
+    real routes classified against two policy snapshots, plus the full-space
+    minimal witness proof.  Re-posting the same input triple returns the
+    existing task (done results are never rewritten).
+    """
+    try:
+        task, _created = impact.create_task(
+            db, body.rib_snapshot_id, body.old_snapshot_id, body.new_snapshot_id)
+        if task.status != impact.TASK_DONE:
+            task = impact.run_task(db, task)
+    except ValidationError as e:
+        raise HTTPException(422, str(e))
+    return impact.task_dict(db, task)
+
+
+@router.get("/impact/tasks")
+def list_impact_tasks(db: Session = Depends(get_db)):
+    tasks = db.query(dbmod.ImpactTask) \
+        .order_by(dbmod.ImpactTask.id.desc()).all()
+    return [impact.task_dict(db, t, include_result=False) for t in tasks]
+
+
+@router.get("/impact/tasks/{tid}")
+def get_impact_task(tid: int, db: Session = Depends(get_db)):
+    task = db.get(dbmod.ImpactTask, tid)
+    if task is None:
+        raise HTTPException(404, "impact task not found")
+    return impact.task_dict(db, task)
+
+
+@router.post("/impact/tasks/{tid}/retry")
+def retry_impact_task(tid: int, db: Session = Depends(get_db)):
+    """Re-run a failed/interrupted task.  Done tasks are final (409)."""
+    try:
+        task = impact.retry_task(db, tid)
+    except RibConflictError as e:
+        raise HTTPException(409, str(e))
+    except ValidationError as e:
+        raise HTTPException(404, str(e))
+    return impact.task_dict(db, task)
+
+
+@router.post("/impact/tasks/{tid}/cross-validate")
+def cross_validate_impact(tid: int, body: ImpactCVIn,
+                          db: Session = Depends(get_db)):
+    """FRR-check a limited, changed-first sample of the RIB against the
+    task's new policy snapshot; evidence is persisted in runs."""
+    try:
+        return impact.cross_validate_impact(db, tid, node=body.node,
+                                            limit=body.limit)
+    except FRRUnavailable as e:
+        raise HTTPException(503, str(e))
+    except ValidationError as e:
+        raise HTTPException(422, str(e))
+
+
+@router.get("/impact/tasks/{tid}/runs")
+def impact_task_runs(tid: int, db: Session = Depends(get_db)):
+    if db.get(dbmod.ImpactTask, tid) is None:
+        raise HTTPException(404, "impact task not found")
+    return impact.task_runs(db, tid)
+
+
+@router.get("/impact/tasks/{tid}/export")
+def export_impact_task(tid: int, format: str = "json",
+                       db: Session = Depends(get_db)):
+    task = db.get(dbmod.ImpactTask, tid)
+    if task is None:
+        raise HTTPException(404, "impact task not found")
+    if format == "csv":
+        return Response(
+            content=impact.export_task_csv(task), media_type="text/csv",
+            headers={"Content-Disposition":
+                     f'attachment; filename="impact-{tid}.csv"'})
+    return impact.export_task_json(db, task)

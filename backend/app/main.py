@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import CORS_ORIGINS
-from .db import init_db
+from .db import init_db, recover_interrupted_tasks
 from .routers.api import router
 
 app = FastAPI(
@@ -31,7 +31,8 @@ app.include_router(router)
 
 @app.on_event("startup")
 def _startup():
-    init_db()
+    init_db()                       # versioned migrations
+    recover_interrupted_tasks()     # crashed 'running' tasks -> failed/retryable
 
 
 @app.get("/api")

@@ -8,11 +8,15 @@ Seed the workbench with the three required worked scenarios.
 3. DEFAULT-FLIP : removing the catch-all permit flips the implicit action.
 
 Each scenario stores two snapshots (before/after) plus an ordered probe
-list, so it is fully replayable.
+list, so it is fully replayable.  We also seed offline RIB collections
+(two for edge-r1, one for edge-v6-r1) and one completed impact task, so
+the RIB/影响分析 tab has replayable content immediately.
 """
 from __future__ import annotations
 
-from . import db as dbmod, service
+import datetime as dt
+
+from . import db as dbmod, impact, service
 
 
 SEEDS = {
@@ -146,6 +150,48 @@ NEIGHBORS = [
          description="local edge IPv6, FRR router-a"),
 ]
 
+# Offline RIB collections (neighbor, family, collected_at, source_version,
+# routes).  Two collections for edge-r1: the same policy change has a
+# DIFFERENT actual impact against each of them.
+RIBS = [
+    dict(neighbor="edge-r1", family=4, label="昨日采集",
+         collected_at="2026-09-24T08:00:00+00:00",
+         source_version="frr-8.4.1/show-ip-bgp#20260924",
+         routes=[
+             "192.168.0.0/16 10.255.0.1",
+             "192.168.100.0/24 10.255.0.1",
+             "192.168.200.0/24 10.255.0.1",
+             "10.1.0.0/16 10.255.0.1",
+             "172.31.5.0/24 10.255.0.2",
+             "203.0.113.0/24 10.255.0.2",
+             "198.51.100.0/24 10.255.0.2",
+             "104.16.0.0/12 10.255.0.2",
+         ]),
+    dict(neighbor="edge-r1", family=4, label="今日采集",
+         collected_at="2026-09-25T08:00:00+00:00",
+         source_version="frr-8.4.1/show-ip-bgp#20260925",
+         routes=[
+             "192.168.0.0/16 10.255.0.1",
+             "192.168.100.0/24 10.255.0.1",
+             "192.168.100.128/25 10.255.0.1",
+             "172.16.0.0/12 10.255.0.2",
+             "172.31.0.0/16 10.255.0.2",
+             "172.31.5.0/24 10.255.0.2",
+             "203.0.113.0/24 10.255.0.2",
+             "8.8.8.0/24 10.255.0.2",
+         ]),
+    dict(neighbor="edge-v6-r1", family=6, label="v6 采集",
+         collected_at="2026-09-25T08:00:00+00:00",
+         source_version="frr-8.4.1/show-ipv6-bgp#20260925",
+         routes=[
+             "2001:db8::/32 2001:db8:ffff::1",
+             "2001:db8:1::/48 2001:db8:ffff::1",
+             "2001:db8:2::/48 2001:db8:ffff::1",
+             "2001:db8:1:1::/64 2001:db8:ffff::1",
+             "2001:db9::/32 2001:db8:ffff::1",
+         ]),
+]
+
 
 def seed_all() -> None:
     dbmod.init_db()
@@ -182,6 +228,26 @@ def seed_all() -> None:
                     )
                     s.add(sc)
                     s.commit()
+
+        # ---- offline RIB collections (idempotent re-import) ----
+        for spec in RIBS:
+            impact.import_rib(
+                s, neighbor_name=spec["neighbor"], family=spec["family"],
+                collected_at=dt.datetime.fromisoformat(spec["collected_at"]),
+                source_version=spec["source_version"], label=spec["label"],
+                routes=spec["routes"])
+
+        # ---- one completed impact task as a replayable demo ----
+        over_permit = s.query(dbmod.Policy).filter_by(name="over-permit").first()
+        rib_today = s.query(dbmod.RibSnapshot).filter_by(
+            source_version="frr-8.4.1/show-ip-bgp#20260925").first()
+        if over_permit is not None and rib_today is not None:
+            snaps = sorted(over_permit.snapshots, key=lambda x: x.version)
+            if len(snaps) >= 2:
+                task, _ = impact.create_task(
+                    s, rib_today.id, snaps[0].id, snaps[-1].id)
+                if task.status != impact.TASK_DONE:
+                    impact.run_task(s, task)
     finally:
         s.close()
 
